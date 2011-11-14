@@ -1,0 +1,21 @@
+This project is studying the design and implement the drivers for a virtualized
+implementation of infiniband over ethernet.  Initially the focus will be for a
+linux-based virtualized Beowulf cluster using KVM.  Our initial goal is to build
+a system that allows application, guest-to-guest communication with a message
+latency time below native TCP/IP based communication.
+
+This project is designed to contribute a larger study that investigates the use
+of off-the-shelf virtualized Beowulf clusters for fine-grained parallel
+processing without requiring expensive, high-performance networking hardware.
+Our primary studies are with parallel discrete event driven simulation (PDES)
+that uses the Time Warp mechanism.  Basically this is a prelude project toward
+the construction of a lightweight "virtual appliance/OS" for Time Warp
+simulation using standard, low-cost networking hardware.  Our ultimate goal is
+to explore techniques for deploying virtualized Beowulf clusters that are shared
+across an organization by a collection of users that may have widely varying
+computational and messaging requirements.
+
+Please feel free to use and/or contribute to this work.  If you have questions,
+ask.  We will try to answer your questions.  This work has been fun for us and
+we hope you will find it interesting/useful.  We welcome suggestions and
+comments at wilseypa@gmail.com.  Thank you.
