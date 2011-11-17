@@ -25,8 +25,6 @@
 
 #include "vrxe.h"
 #include "vhost.h"
-//#include "../infiniband/hw/rxe/rxe.h"
-
 
 enum {
    VHOST_IB_VQ_RX = 0,
