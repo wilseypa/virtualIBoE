@@ -140,6 +140,7 @@ static void handle_tx(struct vhost_ib *ib)
 */
       NF_HOOK(NFPROTO_RXE, NF_RXE_OUT, 
                 skb, skb->dev, NULL, send_finish);
+      vhost_add_used(vq, head, len);  
    }
    mutex_unlock(&vq->mutex);
 }
@@ -178,7 +179,7 @@ static void rcv_wk_func( struct work_struct *work)
            continue;
          }
          pr_warn("head is equal to max vq length. need to handle this\n");
-         goto finish;
+         goto err;
       }
       //if we get an output buffer or no input buffer this is bad
       if(unlikely(out || in <= 0)) 
@@ -216,15 +217,7 @@ static void rcv_wk_func( struct work_struct *work)
       }
       //pr_info("adding used with length: %d\n", len);
       vhost_add_used_and_signal(rvq->dev, rvq, head, len);  
-      int cnt = 0;
-      while(vhost_enable_notify(rvq)){
-         cnt ++;
-         if(cnt > 1000)
-         {
-            pr_warn("notify loop failed\n");
-            break;
-         }
-      }
+      vhost_enable_notify(rvq); 
       goto finish;
    }
  

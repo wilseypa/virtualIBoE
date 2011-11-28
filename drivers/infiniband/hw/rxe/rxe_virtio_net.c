@@ -67,6 +67,7 @@ struct virtib_info *gvib;
 unsigned char mac_addr[6];
 int mac_len;
 static struct work_struct add_rxe_wk;
+static void ib_recv_done(struct virtqueue *rvq);
 
 static void add_rxe_wk_func()
 {
@@ -143,7 +144,14 @@ static void refill_rcv_wk_func(struct work_struct *work)
    struct virtib_info *vib = gvib;
    if(vib)
    {
+      virtqueue_disable_cb(vib->rvq);
       try_fill_recv(vib, GFP_KERNEL);  
+      if(!virtqueue_enable_cb(vib->rvq))
+      {
+         //new recives have arrived so process them
+         pr_warn("refill_rcv_wk: new buffers added while refilling\n");
+         //ib_recv_done(vib->rvq);
+      }
       //pr_info("refill_rcv_wk: vib->max is %d gvib->num is %d", gvib->max, vib->num);
       return;
    }
@@ -161,6 +169,7 @@ static void ib_recv_done(struct virtqueue *rvq)
    unsigned int len;
    unsigned char *test;
    int i;
+   virtqueue_disable_cb(rvq);
    buf = virtqueue_get_buf(rvq, &len);
    if (!buf)
    {
@@ -224,6 +233,12 @@ static void ib_recv_done(struct virtqueue *rvq)
                pr_warn("failed to add work queue\n");
             }
          }
+      }
+      if(!virtqueue_enable_cb(rvq))
+      {
+         //new recives have arrived so process them
+         pr_warn("ib_recv_done: new buffers added while processing current\n");
+         //ib_recv_done(vib->rvq);
       }
    }
    
@@ -291,12 +306,25 @@ static inline int queue_deactivated(struct sk_buff *skb)
    return 0;
 }
 
+static unsigned int free_old_send_skbs(struct virtib_info *vib)
+{
+   struct sk_buff *skb;
+   unsigned int len;
+   while((skb = virtqueue_get_buf(vib->svq, &len)) != NULL)
+   {
+      skb->head += PAGE_OFFSET;
+      kfree_skb(skb);
+   }
+}
+
 static int send(struct rxe_dev *rxe, struct sk_buff *skb)
 {
    //pr_warn("send: called\n");
    int ret = 0;
    int i = 0;
    struct virtib_info *vib = rxe->vinfo;
+   //first free old skbs
+   free_old_send_skbs(vib);
    sg_set_buf(vib->tx_sg, skb, skb->truesize);
    int num_sg = skb_to_sgvec(skb, vib->tx_sg+1, 0, skb->len);
 /*
@@ -313,9 +341,9 @@ static int send(struct rxe_dev *rxe, struct sk_buff *skb)
 */
    ret = virtqueue_add_buf(vib->svq, vib->tx_sg, num_sg + 1, 0, skb);
    //kick the virtqueue
+   skb_orphan(skb);
+   nf_reset(skb);
    virtqueue_kick(vib->svq);
-   //skb_orphan(skb);
-   //nf_reset(skb);
    //pr_warn("send: return is %u\n", ret);
    return ret;
 }
@@ -449,7 +477,7 @@ static int virtrxe_probe(struct virtio_device *vdev)
    pr_warn("virtrxe_probe called\n");
    struct virtib_info *vib;
    struct virtqueue *vqs[2];
-   vq_callback_t *callbacks[] = {ib_recv_done, ib_xmit_done};
+   vq_callback_t *callbacks[] = {ib_recv_done, NULL }; //ib_xmit_done
    const char *names[] = {"input", "output"};
    int err = 0; 
    vib = kmalloc(sizeof(struct virtib_info), GFP_KERNEL);
