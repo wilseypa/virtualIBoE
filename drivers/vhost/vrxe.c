@@ -10,6 +10,7 @@
  */
 
 #include <linux/vhost.h>
+#include <linux/mmu_context.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
@@ -22,6 +23,13 @@
 #include <linux/workqueue.h>
 #include <linux/virtio_net.h>
 #include <rdma/ib_verbs.h>
+#include <linux/sched.h>
+#include <linux/atomic.h>
+
+//#define VHOST_IB_PROF
+#ifdef VHOST_IB_PROF
+#include <linux/timex.h>
+#endif
 
 #include "vrxe.h"
 #include "vhost.h"
@@ -38,7 +46,7 @@ struct vhost_ib {
    //struct net_device *ndev;
 };
 
-//define send workqueue struct
+//define recieve workqueue struct
 static struct workqueue_struct *rcv_wq;
 
 typedef struct {
@@ -52,11 +60,26 @@ spinlock_t vnet_info_lock;
 struct net_device *vib_ndev;
 struct vhost_virtqueue *rvq;
 struct vhost_dev *gdev;
+int warn_desc = 0;
 
+#ifdef VHOST_IB_PROF
+cycles_t start_use_mm;
+cycles_t end_use_mm;
+cycles_t start_unuse_mm;
+cycles_t end_unuse_mm;
+cycles_t start_get_vq_desc;
+cycles_t end_get_vq_desc;
+cycles_t start_mem_cpy;
+cycles_t end_mem_cpy;
+cycles_t start_addr_cpy;
+cycles_t end_addr_cpy;
+cycles_t start_data_cpy;
+cycles_t end_data_cpy;
+#endif
 
 static int send_finish(struct sk_buff *skb)
 {
-   //pr_warn("send finish called\n");
+   //pr_warn("send finish called skb addr: %p skb->data addr: %p\n", skb, skb->data);
    return skb->dev->netdev_ops->ndo_start_xmit(skb, skb->dev);
 }
 static void handle_tx(struct vhost_ib *ib)
@@ -65,16 +88,10 @@ static void handle_tx(struct vhost_ib *ib)
    struct vhost_virtqueue *vq = &ib->dev.vqs[VHOST_IB_VQ_TX];
    unsigned out; 
    unsigned in; 
-   unsigned s;
-   struct vring_desc *skb_desc;
    struct vring_desc *data_desc;
-   struct scatterlist *sg;
    struct sk_buff *skb;
-   struct skb_shared_info *shinfo;
    int len;
    int head;
-   int i;
-   u8 ll_addr[16] = {0, 0x90, 0x47, 0x03, 0x8a, 0x35, 0, 0, 0, 0, 0, 0, 0, 0,0,0};
    
    mutex_lock(&vq->mutex);
    vhost_disable_notify(vq);
@@ -108,36 +125,12 @@ static void handle_tx(struct vhost_ib *ib)
          break;
       }
       len = iov_length(vq->iov, out);
-      skb_desc = (struct vring_desc*)&vq->iov[0].iov_base;
-      data_desc = (struct vring_desc*)&vq->iov[1].iov_base;
-      //set skb pointer 
-      skb = skb_desc->addr;
-      skb->data = data_desc->addr; 
-      skb->head = skb->head - PAGE_OFFSET; 
+      skb = dev_alloc_skb(len);
       skb->dev = vib_ndev;
-      //add a new user to this skb
-      atomic_inc(&skb->users);
-/*
-      pr_info("handle_tx: skb iov length is %d\n", len);
-      pr_info("handle_tx: skb len is %d\n", skb->len);
-      pr_info("data before setting header\n");
-      for (i=0; i<36; i++)
-      {
-         pr_info("at %p:  %04x,", &skb->data[i], skb->data[i]);
-      }
-*/
-      dev_hard_header( skb, skb->dev, 
-                        rxe_eth_proto_id,
-                        ll_addr,
-                        skb->dev->dev_addr, 
-                        skb->len );
-/*
-      pr_info("data after setting header\n");
-      for (i=0; i<36; i++)
-      {
-         pr_info(" %04x,", skb->data[i]);
-      }
-*/
+      data_desc = (struct vring_desc*)&vq->iov[0].iov_base;
+      //skb_add_data(skb, (void __user *)data_desc->addr, len);
+      if(copy_from_user(skb_put(skb,len),(void __user *)data_desc->addr, len))
+         BUG();
       NF_HOOK(NFPROTO_RXE, NF_RXE_OUT, 
                 skb, skb->dev, NULL, send_finish);
       vhost_add_used(vq, head, len);  
@@ -150,19 +143,12 @@ static void rcv_wk_func( struct work_struct *work)
    int head;
    int in;
    int out;
-   int len;
-   int i;
+   unsigned int retries = 0;
    rcv_wk_t *rcv_wk = (rcv_wk_t *)work;
-//   pr_info("rcv_wk_func called\n");
-//   pr_info("The size of recived sk_buff is %d\n", rcv_wk->skb->truesize);
-//   pr_info("The size of recived sk_buff data is %d\n", rcv_wk->skb->len);
-   if(!vhost_vq_access_ok(rvq))
-   {
-      pr_warn("failed to access vq\n");
-      goto err;
-   }   
+
+   use_mm(rvq->dev->mm);
+get_rcv:
    mutex_lock(&rvq->mutex);
-   vhost_disable_notify(rvq);
    for(;;)
    {
       head = vhost_get_vq_desc(rvq->dev, rvq, rvq->iov,
@@ -170,71 +156,67 @@ static void rcv_wk_func( struct work_struct *work)
             &out, &in,
             NULL, NULL);
       //if we are equal to vq size this is a problem
+      if(unlikely(head < 0))
+      {
+         pr_warn("rcv_wk_func: head is less than 0: %d", head);
+         if(retries > 3)
+         {
+            pr_warn("rcv_wk_func: too many errors forgetting skb\n");
+            goto err2;
+         }
+         else if(head == -EFAULT)
+         {
+            //reqeueue work and try again
+            pr_warn("see if something else needs to be run\n");
+            ++retries;
+            mutex_unlock(&rvq->mutex);
+            cond_resched();
+            goto get_rcv;
+         }
+         goto err;
+      }
       if(head == rvq->num)
       {
-         if(unlikely(vhost_enable_notify(rvq)))
-         {
-           pr_warn("cannot renable notify\n");
-           vhost_disable_notify(rvq);
-           continue;
-         }
          pr_warn("head is equal to max vq length. need to handle this\n");
          goto err;
       }
       //if we get an output buffer or no input buffer this is bad
       if(unlikely(out || in <= 0)) 
       {
-         pr_warn("unexpected descirptior format for RX: out: %d, in: %d head: %d\n",
-            out, in, head);
+         if(warn_desc == 0)
+         {
+            pr_warn("unexpected descirptior format for RX: out: %d, in: %d head: %d\n",
+               out, in, head);
+            warn_desc = 1;
+         }
          goto err;
       }
-      if(unlikely(head < 0))
-      {
-         pr_warn("head is less than 0: %d", head);
-         goto err;
-      }
-      //pr_info("vhost_rcv_wk: success! head is: %d vq num is: %d in: %d\n", 
-      //             head, rvq->num, in);
       //Copy data into iovec this seems like the only way to do this
-      len = iov_length(rvq->iov, in);
-      skb_reset_tail_pointer(rcv_wk->skb);
-/*
-      for (i=0; i<rcv_wk->skb->len; i+=2)
-      {
-         pr_info(" %02x%02x,", rcv_wk->skb->data[i], rcv_wk->skb->data[i+1]);
-      }
-*/
-      if(memcpy_toiovecend(rvq->iov, rcv_wk->skb, 0, sizeof(struct sk_buff)) < 0)
-      {
-         pr_warn("failed to copy skb to iovec\n");
-         goto err;
-      }
-      if(memcpy_toiovecend(rvq->iov, rcv_wk->skb->head, sizeof(struct sk_buff) ,
-          rcv_wk->skb->len + rcv_wk->skb->tail) < 0)
+      if(memcpy_toiovecend(rvq->iov, rcv_wk->skb->data, 0,
+          rcv_wk->skb->len) < 0)
       {
          pr_warn("failed to copy skb->data to iovec\n");
          goto err;
       }
-      //pr_info("adding used with length: %d\n", len);
-      vhost_add_used_and_signal(rvq->dev, rvq, head, len);  
-      vhost_enable_notify(rvq); 
+      vhost_add_used_and_signal(rvq->dev, rvq, head, rcv_wk->skb->len); 
       goto finish;
    }
  
 err:
    vhost_discard_vq_desc(rvq,1);
-   pr_info("freeing skb\n");
+   //pr_info("freeing skb\n");
+err2:
    kfree_skb(rcv_wk->skb);
 
 finish:
    mutex_unlock(&rvq->mutex);
 
+   unuse_mm(rvq->dev->mm);
    return;
 }
 
 int handle_rx(struct sk_buff *skb)
 {
-   int ret;
    //basically I have to move all of this to a workqueue since it takes too long
    //and requires context switching (due to mutex) to get the data up to the guest
    rcv_wk_t *work;
@@ -245,7 +227,11 @@ int handle_rx(struct sk_buff *skb)
       {
          INIT_WORK((struct work_struct *)work, rcv_wk_func);
          work->skb = skb;
-         ret = queue_work(rcv_wq, (struct work_struct *)work);
+         queue_work(rcv_wq, (struct work_struct *)work);
+      }
+      else
+      {
+          pr_warn("dropped IB packet\n");
       }
    }
    return 0;
@@ -256,14 +242,6 @@ static void handle_tx_kick(struct vhost_work *work)
    //pr_warn("handle_tx_kick called\n");
    struct vhost_virtqueue *vq = container_of(work, struct vhost_virtqueue, poll.work);
    struct vhost_ib *ib = container_of(vq->dev, struct vhost_ib, dev);
-  
-   //check to see if this works
-   //pr_warn("ib->dev.nvqs is: %d\n", ib->dev.nvqs);
-   //pr_warn("vq address is %p\n", &vq);
-   //pr_warn("tx address is %p rx address is %p\n", &ib->dev.vqs[1], &ib->dev.vqs[0]);
-   //pr_warn("tx address is %p rx address is %p\n", &ib->vqs[1], &ib->vqs[0]);
-   //pr_warn("avail tx address is %p\n", ib->dev.vqs[1].avail);
-   //pr_warn("avail num_free is %d at %p\n", ib->dev.vqs[1].avail_idx, &ib->dev.vqs[1].avail_idx);
 
    handle_tx(ib);
 }
@@ -273,7 +251,6 @@ static void handle_rx_kick(struct vhost_work *work)
    //pr_warn("handle_rx_kick called\n");
    //struct vhost_virtqueue *vq = container_of(work, struct vhost_virtqueue, poll.work);
    //struct vhost_ib *ib = container_of(vq->dev, struct vhost_ib, dev);
-   //handle_rx(ib);
 }
 
 /* Copy argument and remove trailing CR. Return the new length. */
@@ -315,11 +292,11 @@ out:
 
 static int vhost_rxe_open(struct inode *inode, struct file *f)
 {
-   pr_warn("vhost_rxe_open called\n");
    struct vhost_ib *n = kmalloc(sizeof *n, GFP_KERNEL);
    struct vhost_dev *dev;
    int r;
 
+   pr_warn("vhost_rxe_open called\n");
    dev = &n->dev;
    n->vqs[VHOST_IB_VQ_TX].handle_kick = handle_tx_kick;
    n->vqs[VHOST_IB_VQ_RX].handle_kick = handle_rx_kick;
@@ -352,9 +329,10 @@ static int set_backend(struct vhost_ib *n, char* val)
    int i = 0;
    char intf[32];
    struct vhost_virtqueue *vq;
-   mutex_lock(&n->dev.mutex);
    int ret;
+   int len = 0;
 
+   mutex_lock(&n->dev.mutex);
    ret = vhost_dev_check_owner(&n->dev);
    if(ret)
    {
@@ -364,11 +342,14 @@ static int set_backend(struct vhost_ib *n, char* val)
    vq = n->vqs + 1;
    mutex_lock(&vq->mutex);
    //check vq access
+/*
    if(!vhost_vq_access_ok(vq))
    {
       pr_warn("vhost_ib: vq access check failed\n");
    }
+*/
    rvq = &n->vqs[VHOST_IB_VQ_RX];
+   vhost_disable_notify(rvq);
    gdev = &n->dev;
    //test lock unlock
    mutex_lock(&rvq->mutex);
@@ -377,7 +358,7 @@ static int set_backend(struct vhost_ib *n, char* val)
    mutex_unlock(&vq->mutex);
    mutex_unlock(&n->dev.mutex);
 
-   int len = sanitize_arg(val, intf, sizeof(intf));
+   len = sanitize_arg(val, intf, sizeof(intf));
    if (!len)
    {
       pr_err("Invalid interface passed to vhost_ib\n");
@@ -583,7 +564,7 @@ static int rxe_net_rcv(struct sk_buff *skb,
       if (counter == x) {
          x = 13-x; /* 8 or 5 */
          counter = 0;
-         pr_debug("dropping one packet\n");
+         pr_warn("dropping one packet\n");
          goto drop;
       }
    }
@@ -592,15 +573,18 @@ static int rxe_net_rcv(struct sk_buff *skb,
    skb = skb_share_check(skb, GFP_ATOMIC);
    if (!skb) {
       /* still return null */
+      pr_warn("could not copy skb\n");
       goto out;
    }
-   
-   rc = NF_HOOK(NFPROTO_RXE, NF_RXE_IN, skb, ndev, NULL, handle_rx);
+  
+   handle_rx(skb); 
+   //rc = NF_HOOK(NFPROTO_RXE, NF_RXE_IN, skb, ndev, NULL, handle_rx);
 
 out:
    return rc;
 
 drop:
+   pr_info("rxe_net_rcv: dropping packet\n");
    kfree_skb(skb);
    return 0;
 }
@@ -621,12 +605,11 @@ static struct miscdevice vhost_rxe_misc = {
 
 static int vhost_rxe_init(void)
 {
-   int err = 0;
    spin_lock_init(&vnet_info_lock);
    rxe_packet_type.type = cpu_to_be16(rxe_eth_proto_id);
    dev_add_pack(&rxe_packet_type);
-   err = register_netdevice_notifier(&vrxe_net_notifier);   
-   rcv_wq = create_workqueue("recieve_queue");  
+   register_netdevice_notifier(&vrxe_net_notifier);   
+   rcv_wq = alloc_workqueue("recieve_queue", WQ_UNBOUND | WQ_HIGHPRI, 1);  
    pr_warn("rxe virtual host driver loaded\n");
    return misc_register(&vhost_rxe_misc);
 }
