@@ -26,8 +26,8 @@
 #include <linux/sched.h>
 #include <linux/atomic.h>
 
-//#define VHOST_IB_PROF
-#ifdef VHOST_IB_PROF
+#define VHOST_IB_PERF
+#ifdef VHOST_IB_PERF
 #include <linux/timex.h>
 #endif
 
@@ -62,19 +62,28 @@ struct vhost_virtqueue *rvq;
 struct vhost_dev *gdev;
 int warn_desc = 0;
 
-#ifdef VHOST_IB_PROF
-cycles_t start_use_mm;
-cycles_t end_use_mm;
-cycles_t start_unuse_mm;
-cycles_t end_unuse_mm;
-cycles_t start_get_vq_desc;
-cycles_t end_get_vq_desc;
-cycles_t start_mem_cpy;
-cycles_t end_mem_cpy;
-cycles_t start_addr_cpy;
-cycles_t end_addr_cpy;
-cycles_t start_data_cpy;
-cycles_t end_data_cpy;
+#ifdef VHOST_IB_PERF
+#define PERF_SIZE 5000 
+int handle_idx = 0;
+int wk_idx = 0;
+int pr_idx = 0;
+cycles_t start_net_rcv[PERF_SIZE];
+cycles_t start_handle_rx[PERF_SIZE];
+cycles_t start_rcv_wk_func[PERF_SIZE];
+cycles_t end_rcv_wk_func[PERF_SIZE];
+static struct work_struct print_time_wk;
+static void print_time_func()
+{
+   while (pr_idx < PERF_SIZE)
+   {
+       pr_info("vrxe: start_net_rcv: %lu start_handle_rx: %lu start_rcv_wk_func: %lu end_rcv_wk_func: %lu",
+          start_net_rcv[pr_idx],
+          start_handle_rx[pr_idx],
+          start_rcv_wk_func[pr_idx],
+          end_rcv_wk_func[pr_idx]);
+       pr_idx ++; 
+   }
+}
 #endif
 
 static int send_finish(struct sk_buff *skb)
@@ -146,6 +155,9 @@ static void rcv_wk_func( struct work_struct *work)
    unsigned int retries = 0;
    rcv_wk_t *rcv_wk = (rcv_wk_t *)work;
 
+#ifdef VHOST_IB_PERF
+start_rcv_wk_func[wk_idx] = get_cycles();
+#endif
    use_mm(rvq->dev->mm);
 get_rcv:
    mutex_lock(&rvq->mutex);
@@ -209,8 +221,11 @@ err2:
    kfree_skb(rcv_wk->skb);
 
 finish:
+#ifdef VHOST_IB_PERF
+end_rcv_wk_func[wk_idx] = get_cycles();
+wk_idx = (wk_idx + 1) % PERF_SIZE;
+#endif
    mutex_unlock(&rvq->mutex);
-
    unuse_mm(rvq->dev->mm);
    return;
 }
@@ -227,6 +242,10 @@ int handle_rx(struct sk_buff *skb)
       {
          INIT_WORK((struct work_struct *)work, rcv_wk_func);
          work->skb = skb;
+#ifdef VHOST_IB_PERF
+start_handle_rx[handle_idx] = get_cycles();
+handle_idx = (handle_idx + 1) % PERF_SIZE;
+#endif
          queue_work(rcv_wq, (struct work_struct *)work);
       }
       else
@@ -547,6 +566,9 @@ static int rxe_net_rcv(struct sk_buff *skb,
               struct net_device *orig_dev)
 {
    int rc = 0;
+#ifdef VHOST_IB_PERF
+start_net_rcv[handle_idx] = get_cycles();
+#endif
 
    /* TODO: We can receive packets in fragments. For now we
     * linearize and it's costly because we may copy a lot of
@@ -609,7 +631,7 @@ static int vhost_rxe_init(void)
    rxe_packet_type.type = cpu_to_be16(rxe_eth_proto_id);
    dev_add_pack(&rxe_packet_type);
    register_netdevice_notifier(&vrxe_net_notifier);   
-   rcv_wq = alloc_workqueue("recieve_queue", WQ_UNBOUND | WQ_HIGHPRI, 1);  
+   rcv_wq = alloc_workqueue("recieve_queue", WQ_UNBOUND | WQ_HIGHPRI, 1); 
    pr_warn("rxe virtual host driver loaded\n");
    return misc_register(&vhost_rxe_misc);
 }
@@ -617,6 +639,9 @@ module_init(vhost_rxe_init);
 
 static void vhost_rxe_exit(void)
 {
+#ifdef VHOST_IB_PERF
+   print_time_func();
+#endif
    unregister_netdevice_notifier(&vrxe_net_notifier);
    dev_remove_pack(&rxe_packet_type);
    pr_warn("rxe virtual host driver removed\n");

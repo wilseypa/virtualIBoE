@@ -15,7 +15,7 @@
 #include <rdma/ib_addr.h>
 #include "rxe.h"
 #include "rxe_virtio_net.h" 
-//#define VIRT_IB_PROF
+#define VIRT_IB_PROF
 #ifdef VIRT_IB_PROF
 #include <linux/timex.h>
 #endif
@@ -86,16 +86,6 @@ DECLARE_TASKLET( ib_rcv_tasklet, ib_rcv_tasklet_fn, 8);
 cycles_t rcv_int_called;
 cycles_t rcv_wk_called;
 cycles_t rcv_wk_finished;
-cycles_t start_get_buf;
-cycles_t end_get_buf;
-cycles_t start_rxe_rcv;
-cycles_t end_rxe_rcv;
-cycles_t start_queue_wk;
-cycles_t end_queue_wk;
-cycles_t start_vq_en;
-cycles_t end_vq_en;
-cycles_t start_vq_dis;
-cycles_t end_vq_dis;
 #endif
 
 static void add_rxe_wk_func()
@@ -289,11 +279,11 @@ get_bufs:
    }
    atomic_dec(&rcv_lock);
 #ifdef VIRT_IB_PROF
-   rcv_wk_finished= get_cycles();
-   pr_info("interrupt latency is %d time in tasklet %d total time %d",
-           (rcv_wk_called - rcv_int_called)/3,
-           (rcv_wk_finished - rcv_wk_called)/3,
-           (rcv_wk_finished - rcv_int_called)/3);
+   rcv_wk_finished = get_cycles();
+   pr_info("rxe-virtio: rcv_int_called: %lu rcv_wk_called: %lu rcv_wk_finished: %lu",
+           rcv_int_called,
+           rcv_wk_called,
+           rcv_wk_finished);
 #endif
    return;
 }
@@ -306,7 +296,7 @@ static void ib_recv_done(struct virtqueue *rvq)
    if(!atomic_dec_and_test(&rcv_lock))
    {
 #ifdef VIRT_IB_PROF
-      rcv_int_called= get_cycles();
+      rcv_int_called = get_cycles();
 #endif
       virtqueue_disable_cb(rvq);
       tasklet_hi_schedule(&ib_rcv_tasklet);
@@ -618,11 +608,11 @@ static int virtrxe_probe(struct virtio_device *vdev)
    }
    pr_info("vib->num is %d\n", vib->num);
    //create recieve workqueue
-   rxe_rcv_wq = alloc_workqueue("rxe_rcv_queue", WQ_UNBOUND | WQ_HIGHPRI, 1);
-   rcv_work = kmalloc(sizeof(rxe_rcv_wk_t), GFP_KERNEL);
-   INIT_WORK((struct work_struct *)rcv_work, rxe_rcv_wk_func);
-   rcv_work->rvq = vib->rvq;
-   rcv_work->vib = vib;
+   //rxe_rcv_wq = alloc_workqueue("rxe_rcv_queue", WQ_UNBOUND | WQ_HIGHPRI, 1);
+   //rcv_work = kmalloc(sizeof(rxe_rcv_wk_t), GFP_KERNEL);
+   //INIT_WORK((struct work_struct *)rcv_work, rxe_rcv_wk_func);
+   //rcv_work->rvq = vib->rvq;
+   //rcv_work->vib = vib;
    //create refill workqueue;
    refill_wq = alloc_workqueue("refill_queue", WQ_UNBOUND | WQ_HIGHPRI, 1);
    refill_work = kmalloc(sizeof(rxe_rcv_wk_t), GFP_KERNEL);
@@ -671,8 +661,8 @@ static void __devexit virtrxe_remove(struct virtio_device *vdev)
    vdev->config->reset(vdev);
    free_unused_bufs(vib);
    vdev->config->del_vqs(vib->vdev);
-   flush_workqueue(rxe_rcv_wq);
-   destroy_workqueue(rxe_rcv_wq);
+   //flush_workqueue(rxe_rcv_wq);
+   //destroy_workqueue(rxe_rcv_wq);
    flush_workqueue(refill_wq);
    destroy_workqueue(refill_wq);
    tasklet_kill( &ib_rcv_tasklet);
