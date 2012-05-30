@@ -13,9 +13,11 @@
 #include <linux/interrupt.h>
 #include <linux/netdevice.h>
 #include <rdma/ib_addr.h>
+#include <asm/kvm_para.h>
+#include <asm/msr.h>
 #include "rxe.h"
 #include "rxe_virtio_net.h" 
-#define VIRT_IB_PROF
+//#define VIRT_IB_PROF
 #ifdef VIRT_IB_PROF
 #include <linux/timex.h>
 #endif
@@ -23,6 +25,7 @@
 #define MAX_FRAGS (65536/PAGE_SIZE + 2) 
 #define MAX_PACKET_LEN (ETH_HLEN + VLAN_HLEN + ETH_DATA_LEN)
 #define SKB_SIZE (RXE_GRH_BYTES + MAX_PACKET_LEN + sizeof(struct sk_buff))
+#define SKB_RING_SIZE 50 
 
 struct virtib_info {
    struct virtio_device *vdev;
@@ -81,6 +84,8 @@ atomic_t rcv_lock = ATOMIC_INIT(1);
 void ib_rcv_tasklet_fn(unsigned long data);
 DEFINE_SPINLOCK(ib_rcv_lock);
 DECLARE_TASKLET( ib_rcv_tasklet, ib_rcv_tasklet_fn, 8);
+struct sk_buff *skb_ring[SKB_RING_SIZE];
+int skb_ring_idx = 0;
 
 #ifdef VIRT_IB_PROF
 cycles_t rcv_int_called;
@@ -330,10 +335,37 @@ static void ib_xmit_done(struct virtqueue *svq)
    pr_warn("ib_xmit_done called but not implemented\n");
 }
 
+int vib_dealloc_skb_ring()
+{
+   int i;
+   for(i=0; i<SKB_RING_SIZE; i++)
+   {
+      kfree_skb(skb_ring[i]);
+   }
+   return 0;
+}
+
+int vib_alloc_skb_ring()
+{     
+   int i;
+   for(i=0; i<SKB_RING_SIZE; i++)
+   {  
+      skb_ring[i] = alloc_skb(1094 + RXE_GRH_BYTES + MAX_PACKET_LEN, GFP_KERNEL);  //allocate max skb size
+      if(skb_ring[i] == NULL)
+      {
+         pr_err("vrxe_alloc_skb_ring: failed to allocate skb at postion %d\n", i);
+         return 1;
+      }
+      //increment users so buff is not freed after send
+      atomic_inc(&skb_ring[i]->users);
+   }  
+   return 0;
+}
 static void release(struct rxe_dev *rxe)
 
 {
    pr_warn("virt-ib release called\n");
+   vib_dealloc_skb_ring();
    module_put(THIS_MODULE);
 }
 static __be64 rxe_mac_to_eui64 (void)
@@ -466,7 +498,13 @@ static struct sk_buff *init_packet(struct rxe_dev *rxe, struct rxe_av *av, int p
    struct ethhdr *eth;
    
    //need to know how much space to reserve using MAX len for now
-   skb = alloc_skb(paylen + RXE_GRH_BYTES + MAX_PACKET_LEN, GFP_ATOMIC);
+   //skb = alloc_skb(paylen + RXE_GRH_BYTES + MAX_PACKET_LEN, GFP_ATOMIC);
+   skb = skb_ring[skb_ring_idx];
+   skb->data = skb->head;
+   skb_reset_tail_pointer(skb);
+   skb->len = 0;
+   atomic_inc(&skb->users);
+   skb_ring_idx = (skb_ring_idx + 1) % SKB_RING_SIZE; 
    if(!skb)
    {
       pr_warn("failed to allocate skb\n");
@@ -489,7 +527,6 @@ static struct sk_buff *init_packet(struct rxe_dev *rxe, struct rxe_av *av, int p
    {
       pkt->mask |= RXE_LOOPBACK_MASK;
    }
-
    return skb;
 }
 
@@ -534,6 +571,8 @@ static int init_av(struct rxe_dev *rxe, struct ib_ah_attr *attr, struct rxe_av *
 return 0;
  
 }
+
+        
 
 static char *parent_name(struct rxe_dev *rxe, unsigned int port_num)
 {
@@ -626,7 +665,12 @@ static int virtrxe_probe(struct virtio_device *vdev)
       pr_warn("Could not allocate memory\n");
       return 1;
    }
-   
+   //allocate skb ring
+   if(vib_alloc_skb_ring())
+   {
+      pr_warn("could not allcate skbuffer ring\n");
+      return 1;
+   } 
    port_num = 1;
    rxe->ifc_ops = &ifc_ops;
    rxe->vinfo = vib;

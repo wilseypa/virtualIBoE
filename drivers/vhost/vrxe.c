@@ -25,8 +25,8 @@
 #include <rdma/ib_verbs.h>
 #include <linux/sched.h>
 #include <linux/atomic.h>
-
-#define VHOST_IB_PERF
+#define H_SKB_RING_L 50 
+//#define VHOST_IB_PERF
 #ifdef VHOST_IB_PERF
 #include <linux/timex.h>
 #endif
@@ -56,6 +56,8 @@ typedef struct {
 
 static int rxe_eth_proto_id = ETH_P_RXE;
 struct vrxe_net_info vnet_info[RXE_MAX_IF_INDEX];
+struct sk_buff *skb_ring[H_SKB_RING_L];
+int skb_ring_idx = 0;
 spinlock_t vnet_info_lock;
 struct net_device *vib_ndev;
 struct vhost_virtqueue *rvq;
@@ -91,6 +93,7 @@ static int send_finish(struct sk_buff *skb)
    //pr_warn("send finish called skb addr: %p skb->data addr: %p\n", skb, skb->data);
    return skb->dev->netdev_ops->ndo_start_xmit(skb, skb->dev);
 }
+
 static void handle_tx(struct vhost_ib *ib)
 {
    //pr_warn("handle_tx called\n");
@@ -134,7 +137,18 @@ static void handle_tx(struct vhost_ib *ib)
          break;
       }
       len = iov_length(vq->iov, out);
-      skb = dev_alloc_skb(len);
+      //skb = dev_alloc_skb(len);
+      skb = skb_ring[skb_ring_idx]; //dev_alloc_skb(len);
+      //reset tail and len
+      //also inc users so skb not freed
+      skb_reset_tail_pointer(skb);
+      skb->len = 0;
+      atomic_inc(&skb->users);
+      if(skb == NULL)
+      {
+         pr_err("NULL skb at index %d\n", skb_ring_idx);
+      }
+      skb_ring_idx = (skb_ring_idx + 1) % H_SKB_RING_L; //increment index
       skb->dev = vib_ndev;
       data_desc = (struct vring_desc*)&vq->iov[0].iov_base;
       //skb_add_data(skb, (void __user *)data_desc->addr, len);
@@ -265,6 +279,7 @@ static void handle_tx_kick(struct vhost_work *work)
    handle_tx(ib);
 }
 
+
 static void handle_rx_kick(struct vhost_work *work)
 {
    //pr_warn("handle_rx_kick called\n");
@@ -309,6 +324,33 @@ out:
    return rc;
 }
 
+int vrxe_dealloc_skb_ring()
+{
+   int i;
+   for(i=0; i<H_SKB_RING_L; i++)
+   {
+      kfree_skb(skb_ring[i]);
+   }
+   return 0;
+}
+
+int vrxe_alloc_skb_ring()
+{
+   int i;
+   for(i=0; i<H_SKB_RING_L; i++)
+   {
+      skb_ring[i] = dev_alloc_skb(1094);  //allocate max skb size
+      if(skb_ring[i] == NULL)
+      {
+         pr_err("vrxe_alloc_skb_ring: failed to allocate skb at postion %d\n", i);
+         return 1;
+      }
+      //increment users so buff is not freed after send
+      atomic_inc(&skb_ring[i]->users);
+   }
+   return 0;
+}
+
 static int vhost_rxe_open(struct inode *inode, struct file *f)
 {
    struct vhost_ib *n = kmalloc(sizeof *n, GFP_KERNEL);
@@ -331,7 +373,13 @@ static int vhost_rxe_open(struct inode *inode, struct file *f)
    pr_warn("rxe_open: tx addr: %p rx addr: %p\n", 
       &n->vqs[VHOST_IB_VQ_TX],
       &n->vqs[VHOST_IB_VQ_RX]);
-
+   
+   pr_info("Allocating sk_buffs\n");
+   if(vrxe_alloc_skb_ring())
+   {
+      pr_err("rxe_open: failed to allocate skbuff ring\n");
+      return 1;
+   }
    f->private_data = n;
    return 0;
 }
@@ -479,6 +527,7 @@ static int vhost_rxe_release(struct inode *inode, struct file *f)
    struct vhost_ib *n = f->private_data;
    pr_warn("vhost_rxe_release called\n");
    //for now just free structures
+   vrxe_dealloc_skb_ring();
    kfree(n);
    return 0;
 }
